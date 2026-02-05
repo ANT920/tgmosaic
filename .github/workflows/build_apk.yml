@@ -1,0 +1,125 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:  # Позволяет запускать вручную
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git zip unzip openjdk-11-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+
+    - name: Install buildozer and dependencies
+      run: |
+        pip install buildozer cython
+
+    # Скачиваем NDK 25b напрямую — гарантированно получаем нужную версию
+    - name: Download Android NDK 25b
+      run: |
+        mkdir -p /tmp/ndk-download
+        cd /tmp/ndk-download
+        echo "Downloading NDK r25b..."
+        wget -q https://dl.google.com/android/repository/android-ndk-r25b-linux.zip || \
+          (echo "Failed to download NDK from Google" && exit 1)
+        echo "Extracting NDK..."
+        unzip -q android-ndk-r25b-linux.zip
+        NDK_DIR=$(find . -maxdepth 1 -type d -name "*ndk*" | head -1)
+        if [ -z "$NDK_DIR" ]; then
+          echo "ERROR: NDK directory not found after extraction"
+          exit 1
+        fi
+        NDK_ABS_PATH=$(realpath "$NDK_DIR")
+        echo "NDK extracted to: $NDK_ABS_PATH"
+        echo "ndk-path=$NDK_ABS_PATH" >> $GITHUB_OUTPUT
+        echo "NDK_PATH=$NDK_ABS_PATH" >> $GITHUB_ENV
+        ls -la "$NDK_ABS_PATH" | head -10
+      id: download-ndk
+
+    # Кэш может восстановить старый platform с r23b — удалим platform ПОСЛЕ кэша
+    - name: Cache buildozer
+      uses: actions/cache@v4
+      with:
+        path: |
+          /home/runner/.buildozer
+          .buildozer
+        key: buildozer-android-ndk25b-${{ runner.os }}-${{ hashFiles('buildozer.spec', '*.py') }}
+        restore-keys: |
+          buildozer-android-ndk25b-${{ runner.os }}-
+
+    # УДАЛЯЕМ platform ПОСЛЕ кэша — кэш мог восстановить старый r23b, убиваем его
+    - name: Remove platform dir after cache restore (kill old NDK r23b)
+      run: |
+        echo "=== Removing platform dir to prevent old NDK r23b ==="
+        rm -rf /home/runner/.buildozer/android/platform 2>/dev/null || true
+        rm -rf .buildozer/android/platform 2>/dev/null || true
+        echo "Platform dir removed"
+
+    # Buildozer сам подставляет ANDROIDNDK из .buildozer — кладём r25b туда ДО запуска buildozer
+    - name: Install NDK 25b into buildozer platform dir
+      env:
+        NDK_SOURCE: ${{ steps.download-ndk.outputs.ndk-path }}
+      run: |
+        echo "NDK source path: $NDK_SOURCE"
+        if [ -z "$NDK_SOURCE" ] || [ ! -d "$NDK_SOURCE" ]; then
+          echo "ERROR: NDK source is not set or directory doesn't exist: $NDK_SOURCE"
+          exit 1
+        fi
+        mkdir -p /home/runner/.buildozer/android/platform
+        # Убиваем любой старый NDK (на всякий случай)
+        rm -rf /home/runner/.buildozer/android/platform/android-ndk-*
+        rm -rf .buildozer/android/platform/android-ndk-* 2>/dev/null || true
+        # Копируем наш NDK 25b
+        echo "Copying NDK from $NDK_SOURCE to platform dir..."
+        cp -a "$NDK_SOURCE" /home/runner/.buildozer/android/platform/android-ndk-r25b
+        echo "=== NDK in platform dir (should be r25b only) ==="
+        ls -la /home/runner/.buildozer/android/platform/ | grep ndk || echo "No NDK found (will be downloaded)"
+        echo "=== Verifying NDK 25b ==="
+        if [ -d /home/runner/.buildozer/android/platform/android-ndk-r25b ]; then
+          echo "✓ NDK r25b found at: /home/runner/.buildozer/android/platform/android-ndk-r25b"
+          ls -la /home/runner/.buildozer/android/platform/android-ndk-r25b/ | head -5
+        else
+          echo "✗ NDK r25b NOT found!"
+        fi
+
+    - name: Build APK
+      run: |
+        echo "=== Final check: NDK before buildozer ==="
+        ls -la /home/runner/.buildozer/android/platform/ | grep ndk || echo "No NDK directories"
+        if [ -d /home/runner/.buildozer/android/platform/android-ndk-r23b ]; then
+          echo "ERROR: r23b still exists! Removing..."
+          rm -rf /home/runner/.buildozer/android/platform/android-ndk-r23b
+        fi
+        if [ ! -d /home/runner/.buildozer/android/platform/android-ndk-r25b ]; then
+          echo "ERROR: r25b not found! Something went wrong."
+          exit 1
+        fi
+        echo "✓ Using NDK r25b"
+        yes | buildozer android debug
+      env:
+        CI: 1
+        P4A_RELEASE_KEYSTORE: ${{ secrets.P4A_RELEASE_KEYSTORE }}
+        P4A_RELEASE_KEYALIAS: ${{ secrets.P4A_RELEASE_KEYALIAS }}
+        P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.P4A_RELEASE_KEYSTORE_PASSWD }}
+        P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.P4A_RELEASE_KEYALIAS_PASSWD }}
+    
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: tgmosaic-apk
+        path: bin/*.apk
+        retention-days: 30
