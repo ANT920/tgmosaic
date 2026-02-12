@@ -1,0 +1,116 @@
+name: Build APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git zip unzip python3-pip \
+            autoconf libtool pkg-config zlib1g-dev libncurses-dev \
+            libtinfo5 cmake libffi-dev libssl-dev
+
+      - name: Install buildozer
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython
+
+      - name: Download Android SDK command line tools
+        run: |
+          mkdir -p $HOME/android-sdk
+          cd $HOME/android-sdk
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-11076708_latest.zip
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/ 2>/dev/null || true
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+
+      - name: Accept Android licenses
+        run: |
+          mkdir -p $HOME/.android
+          echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" > $HOME/.android/repositories.cfg
+          yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install Android SDK components
+        run: |
+          $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-33" \
+            "build-tools;33.0.2" \
+            "ndk;25.2.9519653"
+        env:
+          ANDROID_SDK_ROOT: $HOME/android-sdk
+
+      - name: Link SDK into Buildozer directory
+        run: |
+          mkdir -p ~/.buildozer/android/platform
+          rm -rf ~/.buildozer/android/platform/android-sdk
+          ln -s $HOME/android-sdk ~/.buildozer/android/platform/android-sdk
+
+      - name: Create sdkmanager symlink for Buildozer
+        run: |
+          mkdir -p ~/.buildozer/android/platform/android-sdk/tools/bin
+          ln -sf $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager ~/.buildozer/android/platform/android-sdk/tools/bin/sdkmanager
+
+      - name: Set environment variables
+        run: |
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$HOME/android-sdk/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "PATH=$PATH:$HOME/android-sdk/cmdline-tools/latest/bin:$HOME/android-sdk/platform-tools" >> $GITHUB_ENV
+
+      - name: Clean build cache
+        run: |
+          rm -rf ~/.buildozer/.cache
+          rm -rf ~/.buildozer/android/platform/build-*
+          rm -rf ~/.buildozer/android/platform/python-for-android
+
+      - name: Setup python-for-android with patched pyjnius
+        run: |
+          P4A_DIR="$HOME/.buildozer/android/platform/python-for-android"
+          git clone https://github.com/kivy/python-for-android.git "$P4A_DIR"
+          cd "$P4A_DIR"
+          rm -rf pythonforandroid/recipes/pyjnius
+          mkdir -p pythonforandroid/recipes/pyjnius
+          cat > pythonforandroid/recipes/pyjnius/__init__.py << 'EOF'
+          from pythonforandroid.recipe import PythonRecipe
+
+          class PyjniusRecipe(PythonRecipe):
+              version = '1.6.1'
+              url = 'https://github.com/Android-for-Python/pyjnius/archive/refs/tags/v{version}.tar.gz'
+              depends = ['python3', 'pygame', 'sdl2', 'six']
+              site_packages_name = 'jnius'
+              call_hostpython_via_targetpython = False
+
+          recipe = PyjniusRecipe()
+          EOF
+          echo "✅ Создан кастомный рецепт pyjnius из форка Android-for-Python"
+
+      - name: Build with Buildozer
+        run: |
+          buildozer android debug
+        env:
+          ANDROID_SDK_ROOT: $HOME/android-sdk
+          ANDROID_NDK_HOME: $HOME/android-sdk/ndk/25.2.9519653
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgmosaic-apk
+          path: bin/*.apk
